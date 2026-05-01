@@ -147,7 +147,7 @@ function findFunctionFile(pathname) {
     }
 
     // 3. 尝试 [[path]].js 通配符匹配（从深到浅）
-    for (let i = parts.length - 1; i >= 0; i--) {
+    for (let i = parts.length; i >= 0; i--) {
         const dirParts = parts.slice(0, i);
         const dirPath = join(FUNCTIONS_DIR, ...dirParts);
         if (existsSync(dirPath) && statSync(dirPath).isDirectory()) {
@@ -392,8 +392,26 @@ app.get('*', async (c) => {
 
 // ==================== 启动服务器 ====================
 
+const webdavBypassMethods = new Set(['PROPFIND', 'MKCOL']);
+
 serve({
-    fetch: app.fetch,
+    fetch: async (request, env, executionCtx) => {
+        const url = new URL(request.url);
+        const pathname = url.pathname;
+        const method = request.method.toUpperCase();
+
+        if (webdavBypassMethods.has(method) && isFunctionPath(pathname)) {
+            try {
+                const response = await handleFunctionRequest(request, pathname);
+                if (response) return response;
+            } catch (err) {
+                console.error('Function error:', err);
+                return new Response(`Internal Server Error: ${err.message}`, { status: 500 });
+            }
+        }
+
+        return app.fetch(request, env, executionCtx);
+    },
     port,
 }, (info) => {
     console.log(`Server running at http://0.0.0.0:${info.port}`);

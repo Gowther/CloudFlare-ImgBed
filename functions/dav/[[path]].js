@@ -1,5 +1,7 @@
 // WebDAV 服务支持
 import { fetchSecurityConfig, fetchOthersConfig } from "../utils/sysConfig";
+import { createSession } from "../utils/auth/sessionManager.js";
+import { getDatabase } from "../utils/databaseAdapter.js";
 
 export async function onRequest(context) {
     const { request, env } = context;
@@ -18,6 +20,7 @@ export async function onRequest(context) {
         case 'PUT': return handlePut(modifiedRequest, env);
         case 'DELETE': return handleDelete(modifiedRequest, env);
         case 'GET': return handleGet(modifiedRequest, env);
+        case 'HEAD': return handleHead(modifiedRequest, env);
         case 'MKCOL': return new Response(null, { status: 201 });
         default: return new Response('Method Not Allowed', { status: 405 });
     }
@@ -27,19 +30,12 @@ export async function onRequest(context) {
 
 async function getApiHeaders(env) {
     const securityConfig = await fetchSecurityConfig(env);
-
     const adminUsername = securityConfig.auth.admin.adminUsername;
-    const adminPassword = securityConfig.auth.admin.adminPassword;
     const authCode = securityConfig.auth.user.authCode;
 
-    let credentials = btoa('unset:unset');
-
-    if (adminUsername && adminPassword) {
-        credentials = btoa(`${adminUsername}:${adminPassword}`);
-    }
-
+    const { cookie } = await createSession(env, 'admin', adminUsername || 'webdav-internal');
     return {
-        'Authorization': `Basic ${credentials}`,
+        'Cookie': cookie.split(';')[0],
         'authCode': authCode || ''
     };
 }
@@ -81,7 +77,7 @@ function handleOptions(request) {
     return new Response(null, {
         status: 204,
         headers: {
-            'Allow': 'OPTIONS, GET, PUT, DELETE, PROPFIND, MKCOL',
+            'Allow': 'OPTIONS, GET, HEAD, PUT, DELETE, PROPFIND, MKCOL',
             'DAV': '1, 2',
             'MS-Author-Via': 'DAV',
         },
@@ -102,23 +98,102 @@ async function handleGet(request, env) {
             return new Response(`Error listing directory: ${error.message}`, { status: 500 });
         }
     } else { // File download
-        try {
-            const fileUrl = new URL(`/file${path}`, request.url);
+        return handleFileRequest(request, env, 'GET');
+    }
+}
 
-            const fileResponse = await fetch(fileUrl.toString());
+async function handleHead(request, env) {
+    const path = decodeURIComponent(new URL(request.url).pathname);
 
-            if (!fileResponse.ok) {
-                 return new Response('File not found', { status: fileResponse.status, statusText: fileResponse.statusText });
-            }
+    if (path.endsWith('/')) {
+        return new Response(null, {
+            status: 200,
+            headers: {
+                'Content-Type': 'text/html; charset=utf-8',
+                'Access-Control-Allow-Origin': '*',
+            },
+        });
+    }
 
-            const response = new Response(fileResponse.body, fileResponse);
-            response.headers.set('Access-Control-Allow-Origin', '*');
+    return handleFileRequest(request, env, 'HEAD');
+}
 
-            return response;
-        } catch (error) {
-            console.error('GET (file) failed:', error.stack);
-            return new Response(`Error getting file: ${error.message}`, { status: 500 });
+async function handleFileRequest(request, env, method) {
+    const path = decodeURIComponent(new URL(request.url).pathname);
+
+    try {
+        const fileUrl = new URL(`/file${path}`, request.url);
+        const fileResponse = await fetch(fileUrl.toString(), {
+            method,
+            headers: buildFileForwardHeaders(request),
+        });
+
+        if (!fileResponse.ok && fileResponse.status !== 206 && fileResponse.status !== 304) {
+            return new Response('File not found', { status: fileResponse.status, statusText: fileResponse.statusText });
         }
+
+        const headers = new Headers(fileResponse.headers);
+        headers.set('Access-Control-Allow-Origin', '*');
+        if (fileResponse.status !== 304) {
+            applyDownloadContentLengthPolicy(headers, method);
+            await applyStoredContentLengthFallback(headers, env, path, method);
+        }
+
+        return new Response(method === 'HEAD' || fileResponse.status === 304 ? null : fileResponse.body, {
+            status: fileResponse.status,
+            statusText: fileResponse.statusText,
+            headers,
+        });
+    } catch (error) {
+        console.error(`${method} (file) failed:`, error.stack);
+        return new Response(`Error getting file: ${error.message}`, { status: 500 });
+    }
+}
+
+function buildFileForwardHeaders(request) {
+    const headers = new Headers();
+    const forwardedHeaders = ['Range', 'If-Range', 'If-None-Match', 'If-Modified-Since', 'Cache-Control', 'Pragma'];
+
+    for (const name of forwardedHeaders) {
+        const value = request.headers.get(name);
+        if (value) {
+            headers.set(name, value);
+        }
+    }
+
+    return headers;
+}
+
+function applyDownloadContentLengthPolicy(headers, method) {
+    if (method === 'GET' && !headers.has('Content-Range') && headers.get('Content-Length') === '0') {
+        headers.delete('Content-Length');
+    }
+}
+
+async function applyStoredContentLengthFallback(headers, env, path, method) {
+    if (method !== 'HEAD') return;
+    if (headers.has('Content-Range')) return;
+
+    const currentLength = headers.get('Content-Length');
+    if (currentLength && currentLength !== '0') return;
+
+    const storedLength = await getStoredContentLength(env, path);
+    if (storedLength !== '0') {
+        headers.set('Content-Length', storedLength);
+    }
+}
+
+async function getStoredContentLength(env, path) {
+    try {
+        const fileId = normalizeDavPathToFileId(path);
+        if (!fileId) return '0';
+
+        const db = getDatabase(env);
+        const file = await db.getWithMetadata(fileId);
+        return getExactWebDAVContentLength(file) || '0';
+    } catch (error) {
+        console.warn('Failed to read stored WebDAV content length:', error.message);
+        return '0';
     }
 }
 
@@ -216,8 +291,18 @@ async function handleDelete(request, env) {
 async function handlePropfind(request, env) {
     const path = decodeURIComponent(new URL(request.url).pathname);
     try {
+        if (path !== '/' && !path.endsWith('/')) {
+            const file = await getStoredFile(env, path);
+            if (file) {
+                await enrichWebDAVContentLengths([file], request, env);
+                const xml = generateWebDAVFileXml(file);
+                return new Response(xml, { status: 207, headers: { 'Content-Type': 'application/xml; charset=utf-8' } });
+            }
+        }
+
         const dir = path === '/' ? '' : path.substring(1, path.endsWith('/') ? path.length - 1 : path.length);
         const contents = await fetchDirectoryContents(dir, env, request);
+        await enrichWebDAVContentLengths(contents.files, request, env);
         const xml = generateWebDAVXml(path, contents);
         return new Response(xml, { status: 207, headers: { 'Content-Type': 'application/xml; charset=utf-8' } });
     } catch (error) {
@@ -255,6 +340,67 @@ async function fetchDirectoryContents(dir, env, request) {
     return { files: allFiles, directories: [...new Set(allDirectories)] };
 }
 
+async function getStoredFile(env, path) {
+    try {
+        const fileId = normalizeDavPathToFileId(path);
+        if (!fileId) return null;
+
+        const db = getDatabase(env);
+        const file = await db.getWithMetadata(fileId);
+        if (!file) return null;
+
+        return {
+            name: fileId,
+            metadata: file.metadata || {},
+        };
+    } catch (error) {
+        console.warn('Failed to read stored WebDAV file metadata:', error.message);
+        return null;
+    }
+}
+
+async function enrichWebDAVContentLengths(files, request, env) {
+    if (!Array.isArray(files) || files.length === 0) return;
+
+    const targets = files.filter(shouldProbeActualContentLength);
+    if (targets.length === 0) return;
+
+    const probeHeaders = await getApiHeaders(env);
+    const concurrency = Math.min(4, targets.length);
+    let index = 0;
+
+    async function worker() {
+        while (index < targets.length) {
+            const file = targets[index++];
+            try {
+                const fileUrl = new URL(`/file/${file.name}`, request.url);
+                fileUrl.searchParams.set('from', 'admin');
+                const response = await fetch(fileUrl.toString(), {
+                    method: 'HEAD',
+                    headers: probeHeaders,
+                });
+                const contentLength = response.headers.get('Content-Length');
+                const contentLengthNumber = Number(contentLength);
+                if (response.ok && Number.isFinite(contentLengthNumber) && contentLengthNumber >= 0) {
+                    file.metadata = file.metadata || {};
+                    file.metadata.WebDAVContentLength = Math.floor(contentLengthNumber).toString();
+                }
+            } catch (error) {
+                console.warn(`Failed to probe WebDAV content length for ${file.name}:`, error.message);
+            }
+        }
+    }
+
+    await Promise.all(Array.from({ length: concurrency }, () => worker()));
+}
+
+function shouldProbeActualContentLength(file) {
+    const metadata = file?.metadata || {};
+    if (metadata.IsChunked) return false;
+
+    return metadata.Channel === 'Telegram' || metadata.Channel === 'TelegramNew';
+}
+
 // --- HTML and XML GENERATION ---
 
 function generateDirectoryListingHtml(basePath, contents) {
@@ -270,9 +416,7 @@ function generateDirectoryListingHtml(basePath, contents) {
     for (const file of contents.files) {
         const fullFilePath = `/dav/${file.name}`; 
         const fileName = file.name.split('/').pop();
-        const fileSize = file.metadata && file.metadata['FileSize'] 
-            ? `${file.metadata['FileSize']} MB` 
-            : 'N/A';
+        const fileSize = getWebDAVFileSizeDisplay(file);
         fileLinks += `<li><a href="${fullFilePath}">${fileName}</a> - ${fileSize}</li>`;
     }
     
@@ -285,7 +429,7 @@ function generateDirectoryListingHtml(basePath, contents) {
     return `<!DOCTYPE html><html><head><title>Index of ${basePath}</title><meta name="viewport" content="width=device-width, initial-scale=1.0"><style>body{font-family:sans-serif;padding:20px}li{margin:5px 0}</style></head><body><h1>Index of ${basePath}</h1><ul>${parentDirLink}${dirLinks}${fileLinks}</ul></body></html>`;
 }
 
-function generateWebDAVXml(basePath, contents) {
+export function generateWebDAVXml(basePath, contents) {
     let responses = '';
     const currentPath = basePath.endsWith('/') ? basePath : `${basePath}/`;
 
@@ -297,6 +441,14 @@ function generateWebDAVXml(basePath, contents) {
     for (const file of contents.files) {
         responses += createFileXml(file);
     }
+    return wrapWebDAVResponses(responses);
+}
+
+export function generateWebDAVFileXml(file) {
+    return wrapWebDAVResponses(createFileXml(file));
+}
+
+function wrapWebDAVResponses(responses) {
     return `<?xml version="1.0" encoding="utf-8"?><D:multistatus xmlns:D="DAV:">${responses}</D:multistatus>`;
 }
 
@@ -304,11 +456,97 @@ function createCollectionXml(path) {
     const now = new Date().toUTCString();
     const cleanPath = path.endsWith('/') ? path.slice(0, -1) : path;
     const name = cleanPath.split('/').pop() || '';
-    return `<D:response><D:href>${encodeURI(path)}</D:href><D:propstat><D:prop><D:displayname>${name}</D:displayname><D:resourcetype><D:collection/></D:resourcetype><D:creationdate>${now}</D:creationdate><D:getlastmodified>${now}</D:getlastmodified></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>`;
+    return `<D:response><D:href>${escapeXml(encodeURI(path))}</D:href><D:propstat><D:prop><D:displayname>${escapeXml(name)}</D:displayname><D:resourcetype><D:collection/></D:resourcetype><D:creationdate>${now}</D:creationdate><D:getlastmodified>${now}</D:getlastmodified></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>`;
 }
 
-function createFileXml(file) {
+export function createFileXml(file) {
     const now = new Date().toUTCString();
-    const fileSize = file.metadata && file.metadata['File-Size'] ? file.metadata['File-Size'] : "0";
-    return `<D:response><D:href>${encodeURI(`/${file.name}`)}</D:href><D:propstat><D:prop><D:displayname>${file.name.split('/').pop()}</D:displayname><D:resourcetype/><D:creationdate>${now}</D:creationdate><D:getlastmodified>${now}</D:getlastmodified><D:getcontentlength>${fileSize}</D:getcontentlength></D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>`;
+    const fileSize = getWebDAVContentLength(file);
+    const contentType = file.metadata?.FileType
+        ? `<D:getcontenttype>${escapeXml(file.metadata.FileType)}</D:getcontenttype>`
+        : '';
+    return `<D:response><D:href>${escapeXml(encodeURI(`/${file.name}`))}</D:href><D:propstat><D:prop><D:displayname>${escapeXml(file.name.split('/').pop())}</D:displayname><D:resourcetype/><D:creationdate>${now}</D:creationdate><D:getlastmodified>${now}</D:getlastmodified><D:getcontentlength>${fileSize}</D:getcontentlength>${contentType}</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>`;
+}
+
+export function getWebDAVContentLength(fileOrMetadata) {
+    const byteSize = getExactWebDAVContentLength(fileOrMetadata);
+    if (byteSize !== null) {
+        return byteSize;
+    }
+
+    const metadata = fileOrMetadata?.metadata || fileOrMetadata || {};
+    const mbSize = firstValidMegabyteSize(metadata.FileSize, metadata.fileSize);
+    return mbSize || '0';
+}
+
+function getExactWebDAVContentLength(fileOrMetadata) {
+    const metadata = fileOrMetadata?.metadata || fileOrMetadata || {};
+    const byteSize = firstValidByteSize(
+        metadata.WebDAVContentLength,
+        metadata.webDAVContentLength,
+        metadata.FileSizeBytes,
+        metadata['FileSizeBytes'],
+        metadata['File-Size'],
+        metadata.ContentLength,
+        metadata.contentLength,
+        metadata.Size,
+        metadata.size
+    );
+
+    if (byteSize !== null) {
+        return byteSize;
+    }
+
+    return null;
+}
+
+function firstValidByteSize(...values) {
+    for (const value of values) {
+        if (value === undefined || value === null || value === '') continue;
+
+        const number = Number(value);
+        if (Number.isFinite(number) && number >= 0) {
+            return Math.floor(number).toString();
+        }
+    }
+
+    return null;
+}
+
+function firstValidMegabyteSize(...values) {
+    for (const value of values) {
+        if (value === undefined || value === null || value === '') continue;
+
+        const number = Number(value);
+        if (Number.isFinite(number) && number >= 0) {
+            return Math.round(number * 1024 * 1024).toString();
+        }
+    }
+
+    return null;
+}
+
+function getWebDAVFileSizeDisplay(file) {
+    if (file.metadata?.FileSize) {
+        return `${file.metadata.FileSize} MB`;
+    }
+
+    const bytes = Number(getWebDAVContentLength(file));
+    if (!Number.isFinite(bytes) || bytes <= 0) return 'N/A';
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(2)} KB`;
+    return `${(bytes / 1024 / 1024).toFixed(2)} MB`;
+}
+
+function normalizeDavPathToFileId(path) {
+    return String(path || '').replace(/^\/+/, '');
+}
+
+function escapeXml(value) {
+    return String(value ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&apos;');
 }

@@ -531,6 +531,7 @@ async function uploadFileToTelegram(context, fullId, metadata, fileExt, fileName
         const id = fileInfo.file_id;
         // 更新FileSize
         metadata.FileSize = (fileInfo.file_size / 1024 / 1024).toFixed(2);
+        metadata.FileSizeBytes = fileInfo.file_size;
 
         // 将响应返回给客户端
         res = createResponse(
@@ -673,6 +674,7 @@ async function uploadFileToDiscord(context, fullId, metadata, returnLink) {
         metadata.Channel = "Discord";
         metadata.ChannelName = discordChannel.name || "Discord_env";
         metadata.FileSize = (fileInfo.file_size / 1024 / 1024).toFixed(2);
+        metadata.FileSizeBytes = fileInfo.file_size;
         metadata.DiscordMessageId = fileInfo.message_id;
         metadata.DiscordChannelId = discordChannel.channelId;
         metadata.DiscordBotToken = discordChannel.botToken;
