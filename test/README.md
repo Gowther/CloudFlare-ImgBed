@@ -35,6 +35,7 @@ The current Mocha entry point automatically loads `.js` test files directly insi
 | --- | --- | --- | --- |
 | Upload | [upload.test.js](upload.test.js) | `functions/upload/` | Upload permissions and IP blocking; directory cleanup and original-name collision avoidance; R2/S3/WebDAV types and metadata; Telegram special formats and compression settings; Telegram/Discord byte sizes after platform processing; R2/S3 multipart initialization, upload and completion; HuggingFace direct upload and commit |
 | Reading and querying | [read.test.js](read.test.js) | `functions/file/`, `api/manage/list.js`, `random/` | R2 GET/HEAD/Range and response types; invalid IDs and missing records; external redirects; administrator preview permissions and private caching; listing directory boundaries, pagination, recursion, counts, search and type filters; random-image `content=` compatibility |
+| WebDAV mounting | [dav.test.js](dav.test.js) | `functions/dav/` | GET/HEAD, exact-length fallback, Range and conditional forwarding, 304/416 preservation; PROPFIND byte/legacy sizes, Telegram size probes and failure fallback; XML escaping, Depth: 0, missing paths, Basic authentication and internal-token MOVE |
 | Deletion | [delete.test.js](delete.test.js) | `api/manage/delete/` | R2 deletion and idempotency; data preservation on R2 failure; actual S3 object keys; batch-ID cleanup, deduplication and input limits; partial success and complete failure; real index updates and cache invalidation after success |
 | Updates | [update.test.js](update.test.js) | `api/manage/metadata/`, `rename/`, `move/` | Editable metadata fields, preservation of existing data and removal of historical credentials; R2 rename and moves between folders or to root; collisions and invalid requests; source preservation on copy failure; legacy Telegram limitations; real index consistency after updates |
 | Authentication and sessions | [auth.test.js](auth.test.js) | `utils/auth/`, `api/manage/_middleware.js` | Old/new password formats, administrator/user separation and unconfigured authentication; token permissions and expiry; authCode sources and precedence; session validity, cookies, TTL and logout; management permission mapping, preflight and caching policies |
@@ -53,6 +54,7 @@ Business paths in the table are relative to `functions/`, except those already s
 - Updates cover metadata and individual R2 renames/moves, not recursive directory moves, migrations across all channels or recovery from every intermediate failure.
 - Image processing, AI and random-image tests cover the behavior listed above. Extend their suites when those features change.
 - Storage requests, cache invalidation and AI calls use doubles. There are no live cloud end-to-end tests, complete Docker image startup checks, browser UI tests or production Cloudflare deployment checks.
+- WebDAV size probes use mocked HEAD responses and timeout errors. Live Telegram/proxy header accuracy and third-party mounting clients still require deployment checks.
 
 Keep gaps explicit here until the corresponding tests exist. Passing CI does not establish that every basic capability has been verified.
 
