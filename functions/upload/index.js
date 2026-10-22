@@ -518,6 +518,7 @@ async function uploadFileToTelegram(context, fullId, metadata, fileExt, fileName
         const id = fileInfo.file_id;
         // 更新FileSize
         metadata.FileSize = (fileInfo.file_size / 1024 / 1024).toFixed(2);
+        metadata.FileSizeBytes = fileInfo.file_size;
 
         // 将响应返回给客户端
         res = buildUploadResponse(context, returnLink);
@@ -638,6 +639,7 @@ async function uploadFileToDiscord(context, fullId, metadata, returnLink) {
         metadata.Channel = "Discord";
         metadata.ChannelName = discordChannel.name || "Discord_env";
         metadata.FileSize = (fileInfo.file_size / 1024 / 1024).toFixed(2);
+        metadata.FileSizeBytes = fileInfo.file_size;
         metadata.DiscordMessageId = fileInfo.message_id;
         // 注意：不存储 DiscordAttachmentUrl，因为 Discord 附件 URL 会在约24小时后过期
         // 读取时会通过 API 获取新的 URL

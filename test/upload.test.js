@@ -22,6 +22,7 @@ describe('upload', () => {
             fetchUploadConfig: async () => ({
                 cfr2: { channels: [{ name: 'mock' }] },
                 telegram: { channels: [{ name: 'mock', botToken: 'mock', chatId: 'mock' }], loadBalance: { enabled: false } },
+                discord: { channels: [{ name: 'mock', botToken: 'mock', channelId: 'mock' }] },
                 s3: { channels: [{ name: 'mock', bucketName: 'mock' }], loadBalance: { enabled: false } },
                 webdav: { channels: [{ name: 'mock', baseUrl: 'https://storage.invalid' }] },
                 huggingface: { channels: [{ name: 'mock', token: 'mock', repo: 'mock/repo', isPrivate: true }] },
@@ -44,8 +45,12 @@ describe('upload', () => {
             CompleteMultipartUploadCommand: class { constructor(input) { this.kind = 'complete'; this.input = input; } },
             TelegramAPI: class {
                 async sendFile(file, chat, method) { storage.method = method; storage.fileName = file.name; return {}; }
-                getFileInfo() { return { file_id: 'mock-id', file_size: 24 }; }
+                getFileInfo() { return { file_id: 'mock-id', file_size: storage.returnedSize ?? 24 }; }
                 async getFilePath() { return 'mock-path'; }
+            },
+            DiscordAPI: class {
+                async sendFile() { return {}; }
+                getFileInfo() { return { message_id: 'mock-id', file_size: storage.returnedSize ?? 24, url: 'https://storage.invalid/photo.png' }; }
             },
             WebDAVAPI: class { async putFile(id, file, type) { storage.contentType = type; } },
             HuggingFaceAPI: class {
@@ -146,6 +151,22 @@ describe('upload', () => {
         }
         await Promise.all(waits);
     });
+
+    for (const channel of ['telegram', 'discord']) {
+        it(`stores the actual ${channel} byte size after the platform changes the uploaded file`, async () => {
+            storage.returnedSize = 68867;
+            const route = await loadFunction('functions/upload/index.js', mocks);
+            const form = new FormData();
+            form.set('file', new File([png(), new Uint8Array(456817 - png().length)], 'photo.png', { type: 'image/png' }));
+            const response = await route.onRequest(context(`https://test/upload?uploadChannel=${channel}&autoRetry=false`, form));
+            assert.equal(response.status, 200, await response.clone().text());
+            const [{ src }] = await response.json();
+            const { metadata } = await db.getWithMetadata(src.slice('/file/'.length));
+            assert.equal(metadata.FileSizeBytes, 68867);
+            assert.equal(metadata.FileSize, (68867 / 1024 / 1024).toFixed(2));
+            await Promise.all(waits);
+        });
+    }
 
     for (const [channel, fileType, expected] of [
         ['cfr2', 'application/octet-stream; charset=binary', 'image/png'],
